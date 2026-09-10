@@ -168,11 +168,8 @@ class CharacterCard(ctk.CTkFrame):
             dot = ctk.CTkLabel(meta, text="●", font=F(10), text_color=class_color(w["klass"]))
             dot.pack(side="left")
             kl = ctk.CTkLabel(meta, text=w["klass"], font=F(11), text_color=TEXT_DIM)
-            kl.pack(side="left", padx=(4, 12))
+            kl.pack(side="left", padx=(4, 0))
             clickables += [dot, kl]
-        pid = ctk.CTkLabel(meta, text=f"PID {w['pid']}", font=F(11), text_color=TEXT_FAINT)
-        pid.pack(side="left")
-        clickables.append(pid)
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.pack(side="right", padx=12)

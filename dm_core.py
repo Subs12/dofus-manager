@@ -27,7 +27,7 @@ import win32process
 import winerror
 
 APP_NAME    = "Dofus Manager"
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
 APP_AUTHOR  = "Subs12"
 COPYRIGHT   = f"© 2026 {APP_AUTHOR}"
 
