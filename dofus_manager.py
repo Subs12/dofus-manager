@@ -109,12 +109,13 @@ class App(ctk.CTk):
     _UPDATE_EVERY_MS = 6 * 3600 * 1000
 
     def _check_update(self, manual=False):
+        found, error = None, None
         try:
             found = dm_update.check_update()
         except Exception as e:
             log.warning("Vérification MAJ : %s", e)
-            found = None
-        core.events.put(("update_found", found, manual))
+            error = str(e)
+        core.events.put(("update_found", found, manual, error))
 
     def _start_update_check(self, manual=False):
         if self._update_busy:  # vérification, dialogue ou téléchargement déjà en cours
@@ -134,7 +135,7 @@ class App(ctk.CTk):
             self.toast("Vérification en cours…")
         self._start_update_check(manual=True)
 
-    def _on_update_found(self, found, manual):
+    def _on_update_found(self, found, manual, error=None):
         if found and (manual or found[0] != config.dismissed_update_tag):
             if not self.winfo_viewable():
                 # Fenêtre cachée dans le tray : un dialogue modal y serait invisible.
@@ -151,9 +152,10 @@ class App(ctk.CTk):
             return
         self._update_busy = False
         if manual:
-            ok = dm_update.available()
-            self.toast("Vous avez déjà la dernière version." if ok
-                       else "GitHub CLI (gh) introuvable : vérification impossible.", "info" if ok else "warning")
+            if error:
+                self.toast("Vérification impossible : GitHub injoignable (connexion internet ?).", "warning")
+            else:
+                self.toast("Vous avez déjà la dernière version.")
 
     def _offer_update(self, tag, notes, asset_name, manual=False):
         self._pending_update = None
@@ -356,7 +358,7 @@ class App(ctk.CTk):
         elif kind == "notice":
             self.toast(ev[1], "warning")
         elif kind == "update_found":
-            self._on_update_found(ev[1], ev[2])
+            self._on_update_found(*ev[1:])
         elif kind == "update_ready":
             self._install_update(ev[1])
         elif kind == "update_error":

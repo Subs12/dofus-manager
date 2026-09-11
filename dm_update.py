@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """Dofus Manager — vérification et installation des mises à jour.
 
-Le dépôt GitHub étant privé, l'API des releases n'est pas accessible publiquement.
-On passe donc par GitHub CLI (`gh`), déjà authentifié sur ce PC, plutôt que
-d'embarquer un jeton d'accès dans l'exécutable. Sans `gh` installé/connecté,
-la vérification est simplement ignorée : jamais d'erreur bloquante pour l'utilisateur.
+Le dépôt GitHub est public : on interroge directement l'API des releases, sans
+compte ni outil à installer. Hors ligne, la vérification échoue simplement.
 """
 import json
 import os
@@ -14,76 +12,53 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 import dm_core as core
 
 REPO = "Subs12/dofus-manager"
-_GH = shutil.which("gh")
+_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+_HEADERS = {"User-Agent": f"DofusManager/{core.APP_VERSION}", "Accept": "application/vnd.github+json"}
 _CREATE_NO_WINDOW = 0x08000000
+_MIN_EXE_SIZE = 5_000_000  # un exe valide fait ~30 Mo ; en dessous, le téléchargement est incomplet
 
 
-def _run(args, timeout=20, capture_stdout=True):
-    if not _GH:
-        return None
-    out = subprocess.PIPE if capture_stdout else subprocess.DEVNULL
-    try:
-        # gh sort de l'UTF-8 : sans encoding explicite, les notes accentuées sont décodées en cp1252.
-        # stdin/stderr explicites : un exe --windowed n'a pas de handles standard valides.
-        r = subprocess.run([_GH, *args], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE,
-                           encoding="utf-8", errors="replace", timeout=timeout,
-                           creationflags=_CREATE_NO_WINDOW)
-        if r.returncode != 0:
-            core.log.debug("gh %s -> %s : %s", args, r.returncode, (r.stderr or "").strip()[:300])
-            return None
-        return r.stdout if capture_stdout else ""
-    except Exception as e:
-        core.log.debug("gh %s: %s", args, e)
-        return None
+def _open(url, timeout):
+    return urllib.request.urlopen(urllib.request.Request(url, headers=_HEADERS), timeout=timeout)
 
 
 def _version_tuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v))
 
 
-def available():
-    return bool(_GH)
-
-
 def check_update():
-    """(tag, notes, asset_name) si une version plus récente est publiée avec un .exe, sinon None."""
-    if not _GH or not getattr(sys, "frozen", False):
+    """(tag, notes, asset) si une version plus récente est publiée avec un .exe, sinon None.
+
+    Lève OSError si GitHub est injoignable.
+    """
+    if not getattr(sys, "frozen", False):
         return None  # rien à vérifier hors exe compilé (mode développement)
-    out = _run(["release", "view", "--repo", REPO, "--json", "tagName,body,assets"])
-    if not out:
-        return None
-    try:
-        data = json.loads(out)
-        asset = next((a["name"] for a in data.get("assets", []) if a["name"].endswith(".exe")), None)
-        if asset and _version_tuple(data["tagName"]) > _version_tuple(core.APP_VERSION):
-            return data["tagName"], (data.get("body") or "").strip(), asset
-    except Exception as e:
-        core.log.warning("Vérification des mises à jour : %s", e)
+    with _open(_API, 15) as r:
+        data = json.load(r)
+    asset = next((a for a in data.get("assets", []) if a.get("name", "").lower().endswith(".exe")), None)
+    tag = data.get("tag_name", "")
+    if asset and _version_tuple(tag) > _version_tuple(core.APP_VERSION):
+        return tag, (data.get("body") or "").strip(), {"url": asset["browser_download_url"],
+                                                       "size": asset.get("size", 0)}
     return None
 
 
-_MIN_EXE_SIZE = 5_000_000  # un exe valide fait ~30 Mo ; en dessous, le téléchargement est incomplet
-
-
-def download(tag, asset_name, progress=None):
+def download(tag, asset):
     """Télécharge l'exe de la release dans un dossier temporaire. Retourne son chemin."""
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_update_"))
-    if progress:
-        progress("Téléchargement…")
-    out = _run(["release", "download", tag, "--repo", REPO, "--pattern", "*.exe",
-               "--dir", str(tmp), "--clobber"], timeout=180, capture_stdout=False)
-    if out is None:
-        raise RuntimeError("Échec du téléchargement (GitHub CLI).")
-    found = list(tmp.glob("*.exe"))
-    if not found:
-        raise RuntimeError("Aucun exécutable trouvé dans la release.")
-    path = found[0]
-    if path.stat().st_size < _MIN_EXE_SIZE:
-        raise RuntimeError("Fichier téléchargé incomplet ou corrompu (taille anormale).")
+    path = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_update_")) / "DofusManager.exe"
+    try:
+        with _open(asset["url"], 30) as r, open(path, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+    except OSError as e:
+        raise RuntimeError(f"échec du téléchargement de {tag} ({e})") from e
+    size = path.stat().st_size
+    if size < _MIN_EXE_SIZE or (asset.get("size") and size != asset["size"]):
+        raise RuntimeError("fichier téléchargé incomplet ou corrompu")
     return path
 
 
