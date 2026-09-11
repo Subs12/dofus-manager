@@ -2,6 +2,7 @@
 """Dofus Manager v4 — point d'entrée : fenêtre principale, navigation, tray, logique d'ordre."""
 import json
 import pathlib
+import queue
 import sys
 import threading
 import time
@@ -65,8 +66,12 @@ class App(ctk.CTk):
         self.layout = {core.char_name(k): int(v) for k, v in core.load_layout().items()}
         self.presets = core.load_presets()
         self._pending_auto = config.auto_apply_last
+        self._applied_preset = None   # preset dont l'ordre fait foi tant que l'utilisateur n'y touche pas
         self._tray = None
         self._tray_hint_shown = False
+        self._update_busy = False
+        self._pending_update = None
+        self._quitting = False
 
         self.overlay = SwitchOverlay(self)
         self.toaster = Toaster(self)
@@ -92,49 +97,94 @@ class App(ctk.CTk):
         if not (config.start_minimized and self._tray):
             remaining = max(0, int(1600 - (time.time() - self._splash_t) * 1000))
             self.after(remaining, self._end_splash)
-        threading.Thread(target=self._check_update, daemon=True).start()
+        self.after(3000, self._periodic_update_check)  # après le splash, mainloop lancée
+        _listen_show_requests()
         log.info("App started (v%s)", core.APP_VERSION)
 
     # ============================================================
     # MISE À JOUR
     # ============================================================
-    def _check_update(self):
+    # Les threads ne touchent jamais Tk (même self.after) : ils passent par core.events.
+    _UPDATE_EVERY_MS = 6 * 3600 * 1000
+
+    def _check_update(self, manual=False):
         try:
             found = dm_update.check_update()
         except Exception as e:
             log.warning("Vérification MAJ : %s", e)
+            found = None
+        core.events.put(("update_found", found, manual))
+
+    def _start_update_check(self, manual=False):
+        if self._update_busy:  # vérification, dialogue ou téléchargement déjà en cours
+            if manual:
+                self.toast("Mise à jour déjà en cours de traitement.")
             return
-        if found:
-            self.after(0, lambda: self._offer_update(*found))
-        elif getattr(self, "_manual_check", False):
-            self.after(0, lambda: self.toast("Vous avez déjà la dernière version." if dm_update.available()
-                                             else "GitHub CLI (gh) introuvable : vérification impossible.",
-                                             "info" if dm_update.available() else "warning"))
-        self._manual_check = False
+        self._update_busy = True
+        threading.Thread(target=self._check_update, args=(manual,), daemon=True).start()
+
+    def _periodic_update_check(self):
+        # Session longue : on revérifie sans redémarrer l'appli.
+        self._start_update_check()
+        self.after(self._UPDATE_EVERY_MS, self._periodic_update_check)
 
     def check_update_now(self):
-        self._manual_check = True
-        self.toast("Vérification en cours…")
-        threading.Thread(target=self._check_update, daemon=True).start()
+        if not self._update_busy:
+            self.toast("Vérification en cours…")
+        self._start_update_check(manual=True)
 
-    def _offer_update(self, tag, notes, asset_name):
+    def _on_update_found(self, found, manual):
+        if found and (manual or found[0] != config.dismissed_update_tag):
+            if not self.winfo_viewable():
+                # Fenêtre cachée dans le tray : un dialogue modal y serait invisible.
+                self._pending_update = (found, manual)
+                self._update_busy = False
+                if self._tray:
+                    try:
+                        self._tray.notify(f"Version {found[0]} disponible — ouvrez Dofus Manager "
+                                          "pour l'installer.", core.APP_NAME)
+                    except Exception:
+                        pass
+                return
+            self._offer_update(*found, manual=manual)
+            return
+        self._update_busy = False
+        if manual:
+            ok = dm_update.available()
+            self.toast("Vous avez déjà la dernière version." if ok
+                       else "GitHub CLI (gh) introuvable : vérification impossible.", "info" if ok else "warning")
+
+    def _offer_update(self, tag, notes, asset_name, manual=False):
+        self._pending_update = None
         msg = f"La version {tag} de {core.APP_NAME} est disponible (vous avez la {core.APP_VERSION})."
         if notes:
             msg += "\n\n" + (notes if len(notes) < 400 else notes[:397] + "…")
         if not confirm(self, "Mise à jour disponible", msg, "Mettre à jour maintenant"):
+            self._update_busy = False
+            if not manual and config.dismissed_update_tag != tag:
+                config.dismissed_update_tag = tag
+                config.save()
             return
+        if config.dismissed_update_tag:
+            config.dismissed_update_tag = ""
+            config.save()
         self.toast(f"Téléchargement de {tag}…", "info")
 
         def work():
             try:
-                path = dm_update.download(tag, asset_name)
-                self.after(0, lambda: self._install_update(path))
+                core.events.put(("update_ready", dm_update.download(tag, asset_name)))
             except Exception as e:
-                self.after(0, lambda: self.toast(f"Mise à jour impossible : {e}", "error"))
+                core.events.put(("update_error", str(e)))
         threading.Thread(target=work, daemon=True).start()
 
     def _install_update(self, path):
-        dm_update.install_and_restart(path)
+        try:
+            dm_update.install_and_restart(path)
+        except Exception as e:
+            log.error("Installation MAJ : %s", e)
+            self._update_busy = False
+            self.toast(f"Mise à jour impossible : {e}", "error")
+            return
         self.quit_app()
 
     # ============================================================
@@ -271,29 +321,46 @@ class App(ctk.CTk):
     # BOUCLES
     # ============================================================
     def _pump_events(self):
-        try:
-            while True:
+        if self._quitting:
+            return
+        for _ in range(200):  # borne : l'UI reste réactive même sous une rafale d'événements
+            try:
                 ev = core.events.get_nowait()
-                kind = ev[0]
-                if kind == "switch":
-                    _, order, hwnd, title = ev
-                    if config.show_overlay:
-                        self.overlay.show(order, hwnd, title, total=len(cycler.snapshot()))
-                    self._set_foreground(hwnd)
-                elif kind == "hotkeys":
-                    self._on_hotkey_status(ev[1])
-                elif kind == "tray":
-                    self._on_tray(ev[1], ev[2] if len(ev) > 2 else None)
-                elif kind == "preset_hotkey" and ev[1] in self.presets:
-                    self.apply_preset(ev[1])
-                    if self._ordered():
-                        self.focus_char(self._ordered()[0]["hwnd"])
-                elif kind == "notice":
-                    self.toast(ev[1], "warning")
-        except Exception as e:
-            if e.__class__.__name__ != "Empty":
-                log.error("Event pump: %s", e)
+            except queue.Empty:
+                break
+            try:  # un événement en erreur ne doit pas bloquer les suivants
+                self._handle_event(ev)
+            except tk.TclError as e:
+                # Race bénigne de CustomTkinter : géométrie mise à jour sur une page pas encore affichée.
+                log.debug("Event %s (UI non affichée) : %s", ev[0], e)
+            except Exception:
+                log.exception("Event %s", ev[0])
         self.after(40, self._pump_events)
+
+    def _handle_event(self, ev):
+        kind = ev[0]
+        if kind == "switch":
+            _, order, hwnd, title = ev
+            if config.show_overlay:
+                self.overlay.show(order, hwnd, title, total=len(cycler.snapshot()))
+            self._set_foreground(hwnd)
+        elif kind == "hotkeys":
+            self._on_hotkey_status(ev[1])
+        elif kind == "tray":
+            self._on_tray(ev[1], ev[2] if len(ev) > 2 else None)
+        elif kind == "preset_hotkey" and ev[1] in self.presets:
+            self.apply_preset(ev[1])
+            if self._ordered():
+                self.focus_char(self._ordered()[0]["hwnd"])
+        elif kind == "notice":
+            self.toast(ev[1], "warning")
+        elif kind == "update_found":
+            self._on_update_found(ev[1], ev[2])
+        elif kind == "update_ready":
+            self._install_update(ev[1])
+        elif kind == "update_error":
+            self._update_busy = False
+            self.toast(f"Mise à jour impossible : {ev[1]}", "error")
 
     def _tick_foreground(self):
         try:
@@ -333,6 +400,7 @@ class App(ctk.CTk):
         for w in wins:
             w["order"] = known[w["hwnd"]] if w["hwnd"] in known else int(self.layout.get(w["name"], 0))
         self.windows = sorted(wins, key=lambda w: (w["order"] <= 0, w["order"], w["name"].lower()))
+        self._follow_preset({w["name"].lower() for w in wins if w["hwnd"] not in known})
         self._renumber(self._ordered())
         if self._pending_auto and self.windows:
             self._auto_apply()
@@ -340,10 +408,24 @@ class App(ctk.CTk):
             self._push_cycle()
         self._rerender()
 
+    def _follow_preset(self, new_names):
+        """Perso d'un preset appliqué qui se connecte après coup : il prend sa place dans le preset
+        (sinon il reprenait sa position mémorisée, en conflit avec l'ordre du preset)."""
+        preset = self.presets.get(self._applied_preset) if self._applied_preset else None
+        if not preset or not new_names or self._pending_auto:
+            return
+        members = {n.lower() for n in preset}
+        others = {w["name"].lower() for w in self.windows
+                  if w["order"] > 0 and w["name"].lower() not in new_names}
+        if new_names & members and others <= members:  # l'ordre n'a pas été retouché à la main
+            self._assign_names(preset)
+            self._save_layout()
+
     def _auto_apply(self):
         name = config.active_preset
         if name in self.presets:
             self._assign_names(self.presets[name])
+            self._applied_preset = name
         if self._ordered():
             self._pending_auto = False
             self.cycle_active = True
@@ -391,6 +473,7 @@ class App(ctk.CTk):
         w = self._get(hwnd)
         if not w:
             return
+        self._applied_preset = None  # ordre personnalisé : il prime sur le preset
         ordered = [x for x in self._ordered() if x is not w]
         if pos <= 0:
             w["order"] = 0
@@ -432,6 +515,7 @@ class App(ctk.CTk):
             return
         for w in self.windows:
             w["order"] = 0
+        self._applied_preset = None
         self.layout = {}
         core.save_layout(self.layout)
         self.cycle_active = False
@@ -451,8 +535,11 @@ class App(ctk.CTk):
         return len(found)
 
     def apply_preset(self, name):
-        names = self.presets.get(name, [])
+        if name not in self.presets:
+            return
+        names = self.presets[name]
         k = self._assign_names(names)
+        self._applied_preset = name if k else None
         self.cycle_active = k > 0
         self._pending_auto = False
         if k:
@@ -465,6 +552,8 @@ class App(ctk.CTk):
     def save_preset(self, orig, name, names):
         if orig and orig != name:
             self.presets.pop(orig, None)
+            if self._applied_preset == orig:
+                self._applied_preset = name
             if config.active_preset == orig:
                 config.active_preset = name
             if orig in config.preset_keys:
@@ -479,6 +568,8 @@ class App(ctk.CTk):
 
     def delete_preset(self, name):
         self.presets.pop(name, None)
+        if self._applied_preset == name:
+            self._applied_preset = None
         core.save_presets(self.presets)
         if config.active_preset == name:
             config.active_preset = ""
@@ -672,6 +763,7 @@ class App(ctk.CTk):
             self.toast(f"Fichier invalide : {e}", "error")
             return
         n = 0
+        self._applied_preset = None
         for w in self.windows:
             w["order"] = data.get(w["name"].lower(), 0)
             n += w["order"] > 0
@@ -713,12 +805,18 @@ class App(ctk.CTk):
 
     def _on_tray(self, action, arg=None):
         if action == "open":
+            if self._splash:  # 2e lancement pendant l'écran de démarrage
+                return
             self.deiconify()
             self.lift()
             self.focus_force()
+            if self._pending_update and not self._update_busy:
+                found, manual = self._pending_update
+                self._update_busy = True
+                self.after(300, lambda: self._offer_update(*found, manual=manual))
         elif action == "pause":
             self.set_paused(not self.paused)
-        elif action == "preset":
+        elif action == "preset" and arg in self.presets:  # menu tray pas encore rafraîchi
             self.apply_preset(arg)
         elif action == "quit":
             self.quit_app()
@@ -736,6 +834,9 @@ class App(ctk.CTk):
             self.quit_app()
 
     def quit_app(self):
+        if self._quitting:
+            return
+        self._quitting = True
         core.stats.flush()
         hotkeys.stop()
         if self._tray:
@@ -758,9 +859,40 @@ def _patch_toplevel_icon():
     ctk.CTkToplevel.__init__ = init
 
 
+_SHOW_EVENT = "Local\\DofusManager_ShowWindow"
+
+
+def _listen_show_requests():
+    """Un 2e lancement (raccourci, menu Démarrer) réaffiche l'instance déjà ouverte."""
+    try:
+        import win32event
+        h = win32event.CreateEvent(None, False, False, _SHOW_EVENT)
+    except Exception as e:
+        log.debug("Événement d'affichage : %s", e)
+        return
+
+    def wait():
+        while True:
+            if win32event.WaitForSingleObject(h, win32event.INFINITE) == win32event.WAIT_OBJECT_0:
+                core.events.put(("tray", "open"))
+    threading.Thread(target=wait, daemon=True).start()
+
+
+def _signal_running_instance():
+    try:
+        import win32event
+        h = win32event.OpenEvent(0x0002, False, _SHOW_EVENT)  # EVENT_MODIFY_STATE
+        win32event.SetEvent(h)
+        return True
+    except Exception:
+        return False  # instance plus ancienne sans cet événement
+
+
 def main():
     if not core.acquire_single_instance():
         log.warning("Instance déjà lancée — arrêt.")
+        if _signal_running_instance():
+            sys.exit(0)
         ctk.set_appearance_mode(config.theme)
         root = ctk.CTk()
         root.withdraw()

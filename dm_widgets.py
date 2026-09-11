@@ -124,10 +124,20 @@ def _class_source(cid):
     return _src_cache[cid]
 
 
+_pil_cache = {}
+
+
 def class_avatar_pil(klass, size, order=0):
-    """Portrait rond de la classe, cerclé de la couleur de position, pastille n° en bas à droite."""
-    cid = class_id(klass)
-    src = _class_source(cid) if cid else None
+    """Portrait rond de la classe, cerclé de la couleur de position, pastille n° en bas à droite.
+    Mis en cache : l'overlay le redemande à chaque changement de fenêtre (latence du HUD)."""
+    key = (class_id(klass), size, order)
+    if key not in _pil_cache:
+        _pil_cache[key] = _render_avatar(key[0], size, order) if key[0] else None
+    return _pil_cache[key]
+
+
+def _render_avatar(cid, size, order):
+    src = _class_source(cid)
     if src is None:
         return None
     big = size * 4
@@ -317,6 +327,8 @@ class SwitchOverlay:
 # TOASTS (notifications non bloquantes, empilées en bas à droite)
 # ============================================================
 class Toaster:
+    MAX = 4
+
     def __init__(self, root):
         self.root = root
         self.active = []
@@ -326,7 +338,12 @@ class Toaster:
             return
         if not self.root.winfo_viewable():  # manager caché : pas de toast par-dessus le jeu
             return
-        color = {"info": ACCENT, "success": SUCCESS, "warning": WARNING, "error": DANGER}[kind]
+        # Même message déjà affiché (ex. raccourci martelé) : pas de doublon empilé.
+        if any(getattr(t, "_text", None) == text for t in self.active):
+            return
+        while len(self.active) >= self.MAX:
+            self._close(self.active[0])
+        color = {"info": ACCENT, "success": SUCCESS, "warning": WARNING, "error": DANGER}.get(kind, ACCENT)
         t = tk.Toplevel(self.root)
         t.overrideredirect(True)
         t.attributes("-topmost", True)
@@ -337,6 +354,7 @@ class Toaster:
         tk.Label(body, text=text, bg=bg, fg=resolve(TEXT), font=F(10, "bold"),
                  padx=16, pady=11, justify="left", wraplength=360).pack()
         make_click_through(t)
+        t._text = text
         self.active.append(t)
         self._layout()
         self.root.after(ms, lambda: self._close(t))

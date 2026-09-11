@@ -87,10 +87,15 @@ def confirm(parent, title, message, ok_text="Confirmer", danger=False):
     """Boîte de confirmation modale au style de l'app. Retourne True/False."""
     top = ctk.CTkToplevel(parent)
     top.title(title)
-    top.geometry("440x200")
     top.resizable(False, False)
     top.configure(fg_color=BG)
-    top.transient(parent.winfo_toplevel())
+    owner = parent.winfo_toplevel()
+    # Fenêtre principale cachée (zone de notification) : une boîte « transient » serait
+    # invisible et bloquerait l'attente indéfiniment. On l'affiche alors au premier plan.
+    if owner.winfo_viewable():
+        top.transient(owner)
+    else:
+        top.attributes("-topmost", True)
     result = {"ok": False}
     ctk.CTkLabel(top, text=title, font=F(16, "bold"), text_color=TEXT).pack(anchor="w", padx=26, pady=(24, 6))
     ctk.CTkLabel(top, text=message, font=F(12), text_color=TEXT_DIM, justify="left",
@@ -99,6 +104,8 @@ def confirm(parent, title, message, ok_text="Confirmer", danger=False):
     row.pack(side="bottom", fill="x", padx=26, pady=22)
 
     def done(ok):
+        if not top.winfo_exists():  # Entrée + clic quasi simultanés
+            return
         result["ok"] = ok
         top.destroy()
 
@@ -106,7 +113,16 @@ def confirm(parent, title, message, ok_text="Confirmer", danger=False):
     button(row, "Annuler", lambda: done(False)).pack(side="right", padx=8)
     top.bind("<Escape>", lambda e: done(False))
     top.bind("<Return>", lambda e: done(True))
-    top.after(60, lambda: (top.lift(), top.focus_force(), top.grab_set()))
+    # Hauteur adaptée au message (les notes de mise à jour débordaient d'une boîte fixe de 200 px).
+    top.update_idletasks()
+    w, h = 440, max(200, top.winfo_reqheight())
+    if owner.winfo_viewable():
+        x = owner.winfo_rootx() + (owner.winfo_width() - w) // 2
+        y = owner.winfo_rooty() + (owner.winfo_height() - h) // 3
+    else:
+        x, y = (top.winfo_screenwidth() - w) // 2, (top.winfo_screenheight() - h) // 3
+    top.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+    top.after(60, lambda: top.winfo_exists() and (top.lift(), top.focus_force(), top.grab_set()))
     parent.wait_window(top)
     return result["ok"]
 
@@ -251,8 +267,10 @@ class WindowsPage(Page):
                                    height=36, corner_radius=10, fg_color=CARD, border_color=BORDER,
                                    text_color=TEXT, font=F(12))
         self.search.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.search.bind("<KeyRelease>", lambda e: self.render())
-        self.search.bind("<Escape>", lambda e: (self.search.delete(0, "end"), self.render()))
+        self._search_job = None
+        self._last_query = ""
+        self.search.bind("<KeyRelease>", lambda e: self._on_search())
+        self.search.bind("<Escape>", lambda e: (self.search.delete(0, "end"), self._on_search(now=True)))
         self.preset_menu = ctk.CTkOptionMenu(tb, values=["—"], command=self._on_preset, height=36,
                                              width=210, corner_radius=10, font=F(12, "bold"),
                                              fg_color=CARD, button_color=CARD,
@@ -281,6 +299,21 @@ class WindowsPage(Page):
     def on_show(self):
         self.refresh_presets()
         self.refresh_layouts()
+
+    def _on_search(self, now=False):
+        # Anti-rebond : on ne reconstruit la liste qu'une fois la frappe terminée, et
+        # seulement si le texte a changé (flèches, Maj… ne déclenchent plus de rendu).
+        if self._search_job:
+            self.after_cancel(self._search_job)
+            self._search_job = None
+        q = self.search.get().strip().lower()
+        if q == self._last_query:
+            return
+        if now:
+            self._last_query = q
+            self.render()
+        else:
+            self._search_job = self.after(150, lambda: self._on_search(now=True))
 
     def refresh_layouts(self):
         self._layout_choices = self.app.layout_choices()
@@ -311,10 +344,13 @@ class WindowsPage(Page):
             self.banner.pack_forget()
 
     def render(self):
+        # Un rafraîchissement auto pendant un glisser-déposer détruit les cartes : on abandonne le drag.
+        self._drag = self._target = None
         for ch in self.list.winfo_children():
             ch.destroy()
         self.cards = {}
         q = self.search.get().strip().lower()
+        self._last_query = q
         wins = [w for w in self.app.windows if not q or q in w["title"].lower()]
         ordered = [w for w in wins if w["order"] > 0]
         others = [w for w in wins if w["order"] <= 0]
@@ -365,7 +401,7 @@ class WindowsPage(Page):
         c.configure(border_color=ACCENT)
 
     def drag_motion(self, y_root):
-        if not self._drag:
+        if not self._drag or not self._drag.winfo_exists():
             return
         target = None
         for c in self.cards.values():
@@ -385,6 +421,10 @@ class WindowsPage(Page):
     def end_drag(self):
         src, dst = self._drag, self._target
         self._drag = self._target = None
+        if src and not src.winfo_exists():
+            return
+        if dst and not dst.winfo_exists():
+            dst = None
         if src and dst:
             self.app.move_to(src.w["hwnd"], dst.w["order"])
         elif src:
@@ -423,7 +463,9 @@ class PresetEditDialog(ctk.CTkToplevel):
         button(row, "Enregistrer", self._save, "primary").pack(side="right")
         button(row, "Annuler", self.destroy).pack(side="right", padx=8)
         self.bind("<Escape>", lambda e: self.destroy())
-        self.after(60, lambda: (self.lift(), self.focus_force(), self.name.focus_set(), self.grab_set()))
+        self.name.bind("<Return>", lambda e: self.box.focus_set())
+        self.after(60, lambda: self.winfo_exists() and (self.lift(), self.focus_force(),
+                                                        self.name.focus_set(), self.grab_set()))
 
     def _fill_current(self):
         cur = [w["name"] for w in sorted(self.app.windows, key=lambda w: w["order"]) if w["order"] > 0]
@@ -432,7 +474,15 @@ class PresetEditDialog(ctk.CTkToplevel):
 
     def _save(self):
         name = self.name.get().strip()
-        names = [n.strip() for n in self.box.get("1.0", "end").splitlines() if n.strip()]
+        # Casse alignée sur les persos connus (« schokoarc » -> « Schokoarc ») et doublons retirés :
+        # un même nom deux fois laissait des trous dans la numérotation du cycle.
+        known = {n.lower(): n for n in self.app.known_chars()}
+        names, seen = [], set()
+        for n in self.box.get("1.0", "end").splitlines():
+            n = n.strip()
+            if n and n.lower() not in seen:
+                seen.add(n.lower())
+                names.append(known.get(n.lower(), n))
         if not name:
             self.app.toast("Donnez un nom au preset.", "warning")
             return
@@ -443,8 +493,12 @@ class PresetEditDialog(ctk.CTkToplevel):
             if not confirm(self, "Écraser ?", f"Un preset « {name} » existe déjà. Le remplacer ?",
                            "Remplacer", danger=True):
                 return
+        unknown = [n for n in names if n.lower() not in known]
         self.destroy()
         self.on_save(self.orig, name, names)
+        if unknown:
+            self.app.toast("Jamais vu" + ("s" if len(unknown) > 1 else "") + " : " + ", ".join(unknown)
+                           + " — vérifiez l'orthographe.", "warning")
 
 
 class PresetsPage(Page):
@@ -515,7 +569,8 @@ class PresetsPage(Page):
             button(act, "Modifier", lambda n=name: self.edit(n)).pack(side="left", padx=6)
             is_def = config.active_preset == name
             button(act, "Retirer défaut" if is_def else "Par défaut",
-                   lambda n=name: self.app.set_default_preset("" if is_def else n), "subtle").pack(side="left")
+                   lambda n=name, d=is_def: self.app.set_default_preset("" if d else n),
+                   "subtle").pack(side="left")
             button(act, "Supprimer", lambda n=name: self.delete(n), "danger").pack(side="right")
 
     def edit(self, name=""):
@@ -718,8 +773,19 @@ class HotkeysPage(Page):
         return m
 
     def render(self):
+        # Conserve la position de défilement : sinon chaque modification de touche remonte en haut.
+        canvas = getattr(self.body, "_parent_canvas", None)
+        try:
+            y = canvas.yview()[0] if canvas else 0.0
+        except tk.TclError:
+            y = 0.0
         for ch in self.body.winfo_children():
             ch.destroy()
+        self._build_rows()
+        if canvas and y:
+            self.after_idle(lambda: canvas.winfo_exists() and canvas.yview_moveto(y))
+
+    def _build_rows(self):
         section_label(self.body, "Navigation", pady=(0, 8))
         c = card(self.body)
         c.pack(fill="x")

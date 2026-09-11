@@ -3,6 +3,7 @@
 
 Aucune interaction avec la mémoire du jeu : uniquement des API de fenêtrage Win32.
 """
+import copy
 import ctypes
 from ctypes import wintypes
 from datetime import date
@@ -27,7 +28,7 @@ import win32process
 import winerror
 
 APP_NAME    = "Dofus Manager"
-APP_VERSION = "4.2"
+APP_VERSION = "4.3"
 APP_AUTHOR  = "Subs12"
 COPYRIGHT   = f"© 2026 {APP_AUTHOR}"
 
@@ -53,22 +54,42 @@ log = logging.getLogger("DofusManager")
 
 
 def read_json(path, default):
+    """Lit un JSON ; si le contenu n'a pas le type de `default`, renvoie `default`."""
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(data, type(default)):
+                return data
+            log.warning("%s : format inattendu, ignoré.", path.name)
     except Exception as e:
         log.warning("Lecture %s impossible : %s", path.name, e)
+        # Sinon la prochaine sauvegarde écraserait définitivement le fichier illisible.
+        try:
+            os.replace(path, path.with_suffix(path.suffix + ".corrupt"))
+        except OSError:
+            pass
     return default
 
 
 def write_json(path, data):
     """Écriture atomique : un crash en cours d'écriture ne corrompt pas le fichier."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
     except Exception as e:
         log.error("Écriture %s impossible : %s", path.name, e)
+        return
+    for attempt in range(5):  # antivirus / indexeur peuvent verrouiller brièvement la cible
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            if attempt == 4:
+                log.error("Écriture %s impossible : %s", path.name, e)
+            time.sleep(0.05)
+        except Exception as e:
+            log.error("Écriture %s impossible : %s", path.name, e)
+            return
 
 
 # Événements émis par les threads d'arrière-plan (raccourcis, tray) et consommés
@@ -97,6 +118,10 @@ user32.RegisterHotKey.argtypes     = [wintypes.HWND, ctypes.c_int, wintypes.UINT
 user32.RegisterHotKey.restype      = wintypes.BOOL
 user32.UnregisterHotKey.argtypes   = [wintypes.HWND, ctypes.c_int]
 user32.GetForegroundWindow.restype = wintypes.HWND
+user32.IsHungAppWindow.argtypes    = [wintypes.HWND]
+user32.IsHungAppWindow.restype     = wintypes.BOOL
+user32.ShowWindow.argtypes         = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindowAsync.argtypes    = [wintypes.HWND, ctypes.c_int]
 user32.MapVirtualKeyW.argtypes     = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype      = wintypes.UINT
 user32.GetKeyNameTextW.argtypes    = [wintypes.LPARAM, wintypes.LPWSTR, ctypes.c_int]
@@ -236,6 +261,13 @@ def char_name(title):
 # ============================================================
 # CONFIG
 # ============================================================
+def _to_int(val, default=0):
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 class Config:
     DEFAULTS = {
         "theme": "dark",
@@ -253,6 +285,7 @@ class Config:
         "active_preset": "",
         "preset_keys": {},            # {nom_preset: {"vkey", "mods"}}
         "char_classes": {},           # {perso: classe} mémorisé pour les persos déconnectés
+        "dismissed_update_tag": "",   # version refusée : pas de re-proposition auto tant qu'elle est la dernière
     }
 
     def __init__(self):
@@ -262,20 +295,18 @@ class Config:
             if isinstance(v, bool):
                 val = bool(val)
             elif isinstance(v, int):
-                try:
-                    val = int(val)
-                except (TypeError, ValueError):
-                    val = v
-            setattr(self, k, val)
+                val = _to_int(val, v)
+            elif not isinstance(val, type(v)):
+                val = v  # ex. "theme": null dans un config.json édité à la main
+            setattr(self, k, copy.deepcopy(val))  # jamais d'alias vers DEFAULTS
+        if self.theme not in ("dark", "light", "system"):
+            self.theme = "dark"
         # target : "pos:N" (position N du cycle) ou "char:Nom" (personnage précis)
-        self.direct_keys = [{"vkey": int(d.get("vkey") or 0), "mods": int(d.get("mods") or 0),
+        self.direct_keys = [{"vkey": _to_int(d.get("vkey")), "mods": _to_int(d.get("mods")),
                              "target": str(d.get("target") or f"pos:{i + 1}")}
-                            for i, d in enumerate(x for x in (self.direct_keys or []) if isinstance(x, dict))]
-        if not isinstance(self.char_classes, dict):
-            self.char_classes = {}
-        pk = self.preset_keys if isinstance(self.preset_keys, dict) else {}
-        self.preset_keys = {str(k): {"vkey": int(v.get("vkey") or 0), "mods": int(v.get("mods") or 0)}
-                            for k, v in pk.items() if isinstance(v, dict) and v.get("vkey")}
+                            for i, d in enumerate(x for x in self.direct_keys if isinstance(x, dict))]
+        self.preset_keys = {str(k): {"vkey": _to_int(v.get("vkey")), "mods": _to_int(v.get("mods"))}
+                            for k, v in self.preset_keys.items() if isinstance(v, dict) and _to_int(v.get("vkey"))}
 
     def save(self):
         write_json(CONFIG_PATH, {k: getattr(self, k) for k in self.DEFAULTS})
@@ -296,7 +327,7 @@ DEFAULT_PRESETS = {"Équipe principale": ["Exoticlozie", "Schokocafe", "Schokobu
 
 
 def load_layout():
-    return read_json(LAYOUT_PATH, {})
+    return {str(k): _to_int(v) for k, v in read_json(LAYOUT_PATH, {}).items()}
 
 
 def save_layout(mapping):
@@ -308,7 +339,8 @@ def load_presets():
         write_json(PRESETS_PATH, DEFAULT_PRESETS)
         return dict(DEFAULT_PRESETS)
     data = read_json(PRESETS_PATH, {})
-    return {str(k): [str(n) for n in v] for k, v in data.items() if isinstance(v, list)}
+    return {str(k): [str(n) for n in v if isinstance(n, str) and n.strip()]
+            for k, v in data.items() if isinstance(v, list)}
 
 
 def save_presets(mapping):
@@ -362,9 +394,16 @@ class SessionStats:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.history = read_json(STATS_PATH, {"days": {}})
-        if not isinstance(self.history.get("days"), dict):
-            self.history = {"days": {}}
+        raw = read_json(STATS_PATH, {"days": {}}).get("days")
+        days = {}
+        for key, d in (raw.items() if isinstance(raw, dict) else []):
+            if not isinstance(d, dict):
+                continue
+            chars = {str(n): {"seconds": float(v.get("seconds") or 0), "count": _to_int(v.get("count"))}
+                     for n, v in (d.get("chars") or {}).items() if isinstance(v, dict)} \
+                if isinstance(d.get("chars"), dict) else {}
+            days[str(key)] = {"chars": chars, "switches": _to_int(d.get("switches"))}
+        self.history = {"days": days}
         self._new_session()
 
     def _new_session(self):
@@ -382,6 +421,8 @@ class SessionStats:
 
     def on_focus(self, name):
         with self._lock:
+            if name == self._cur:
+                return  # re-focus du perso déjà affiché : pas un changement
             now = time.time()
             if self._cur:
                 self._times[self._cur] = self._times.get(self._cur, 0) + now - self._cur_start
@@ -470,8 +511,8 @@ def get_process_name(pid):
     h = None
     try:
         h = win32api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        buf = ctypes.create_unicode_buffer(260)
-        size = wintypes.DWORD(260)
+        buf = ctypes.create_unicode_buffer(1024)  # chemins longs (> MAX_PATH)
+        size = wintypes.DWORD(1024)
         if kernel32.QueryFullProcessImageNameW(int(h), 0, buf, ctypes.byref(size)):
             return pathlib.Path(buf.value).name.lower()
     except Exception:
@@ -532,14 +573,17 @@ def focus_window(hwnd, maximize=True):
         log.warning("Focus ignoré : fenêtre fermée (hwnd=%s)", hwnd)
         return False
     try:
+        # Fenêtre figée (chargement, freeze du client) : ShowWindow synchrone bloquerait
+        # le thread des raccourcis, et donc tous les autres raccourcis.
+        show = user32.ShowWindowAsync if user32.IsHungAppWindow(hwnd) else user32.ShowWindow
         if maximize:
             # Un seul SW_MAXIMIZE : un SW_RESTORE préalable provoque un flash de la
             # fenêtre à sa taille « restaurée » (visible en multi-écran).
             if not (win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED):
-                win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                show(hwnd, win32con.SW_MAXIMIZE)
         elif win32gui.IsIconic(hwnd):
             # Ne pas SW_RESTORE une fenêtre maximisée : ça la réduirait.
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            show(hwnd, win32con.SW_RESTORE)
 
         fg = user32.GetForegroundWindow()
         fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
@@ -617,7 +661,8 @@ cycler = WindowCycler()
 def do_cycle(delta=0, goto=None):
     target = cycler.step(delta, goto)
     if target and focus_window(target[1], config.auto_maximize):
-        events.put(("switch", target[0], target[1], target[2]))
+        title = win32gui.GetWindowText(target[1]).strip() or target[2]  # titre à jour pour l'overlay
+        events.put(("switch", target[0], target[1], title))
 
 
 _last_named = [0.0]
@@ -702,7 +747,8 @@ def _place(hwnd, x, y, w, h):
 def arrange_windows(hwnds, mode, monitor_index=0):
     """mode : 'single' (tous en plein écran sur un écran), 'grid' (mosaïque sur un écran),
     'spread' (un perso par écran), 'maximize' (plein écran là où ils sont)."""
-    hwnds = [h for h in hwnds if win32gui.IsWindow(h)]
+    # Une fenêtre figée bloquerait SetWindowPos (donc l'interface) : on la saute.
+    hwnds = [h for h in hwnds if win32gui.IsWindow(h) and not user32.IsHungAppWindow(h)]
     mons = list_monitors()
     if not hwnds or not mons:
         return 0
@@ -807,6 +853,9 @@ class HotkeyManager:
         self._tid = kernel32.GetCurrentThreadId()
         self._ready.set()
         ids = [] if self.paused else self._register(spec)
+        if not self._q.empty():
+            # Commande envoyée avant que _tid soit connu : le message de réveil n'est jamais parti.
+            user32.PostThreadMessageW(self._tid, WM_APP_CMD, 0, 0)
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_APP_CMD:
                 stop = False
@@ -844,5 +893,10 @@ _mutex = None
 
 def acquire_single_instance():
     global _mutex
-    _mutex = win32event.CreateMutex(None, False, "Global\\DofusManager_SingleInstance_Mutex")
+    try:
+        _mutex = win32event.CreateMutex(None, False, "Global\\DofusManager_SingleInstance_Mutex")
+    except Exception as e:
+        # Accès refusé : le mutex existe déjà (créé par une instance d'un autre niveau de privilège).
+        log.warning("Mutex d'instance : %s", e)
+        return False
     return win32api.GetLastError() != winerror.ERROR_ALREADY_EXISTS
