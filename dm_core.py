@@ -28,7 +28,7 @@ import win32process
 import winerror
 
 APP_NAME    = "Dofus Manager"
-APP_VERSION = "4.5"
+APP_VERSION = "4.6"
 APP_AUTHOR  = "Subs12"
 COPYRIGHT   = f"© 2026 {APP_AUTHOR}"
 
@@ -104,8 +104,23 @@ kernel32 = ctypes.windll.kernel32
 
 WM_HOTKEY    = 0x0312
 WM_APP_CMD   = 0x8001
+WM_APP_MOUSE = 0x8002
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 VK_F21, VK_F23 = 0x84, 0x86
+
+# Boutons de souris : RegisterHotKey ne gère que le clavier, ils passent par un crochet
+# bas niveau (voir _MouseHook). Codes pseudo-VK hors de la plage des touches (0x00-0xFF)
+# pour être stockés, comparés et affichés comme n'importe quel autre raccourci.
+MOUSE_VK_BASE = 0x10000
+MOUSE_X1  = MOUSE_VK_BASE | 1   # bouton 4 (arrière)
+MOUSE_X2  = MOUSE_VK_BASE | 2   # bouton 5 (avant)
+MOUSE_MID = MOUSE_VK_BASE | 3   # clic molette
+_MOUSE_NAMES = {MOUSE_X1: "Souris 4", MOUSE_X2: "Souris 5", MOUSE_MID: "Clic molette"}
+
+
+def is_mouse_vk(vk):
+    return bool(int(vk or 0) & MOUSE_VK_BASE)
+
 
 user32.GetMessageW.argtypes        = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
                                       wintypes.UINT, wintypes.UINT]
@@ -127,6 +142,8 @@ user32.MapVirtualKeyW.restype      = wintypes.UINT
 user32.GetKeyNameTextW.argtypes    = [wintypes.LPARAM, wintypes.LPWSTR, ctypes.c_int]
 user32.VkKeyScanW.argtypes         = [wintypes.WCHAR]
 user32.VkKeyScanW.restype          = wintypes.SHORT
+user32.GetAsyncKeyState.argtypes   = [ctypes.c_int]
+user32.GetAsyncKeyState.restype    = wintypes.SHORT
 kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
                                                  wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
 kernel32.QueryFullProcessImageNameW.restype  = wintypes.BOOL
@@ -174,6 +191,8 @@ _EXTENDED_VK = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B
 
 def vk_name(vk):
     vk = int(vk)
+    if is_mouse_vk(vk):
+        return _MOUSE_NAMES.get(vk, f"Souris {vk & 0xFF}")
     if 0x70 <= vk <= 0x87:
         return f"F{vk - 0x6F}"
     try:
@@ -196,6 +215,16 @@ def mods_name(mods):
     if mods & MOD_SHIFT:   parts.append("Shift")
     if mods & MOD_WIN:     parts.append("Win")
     return "+".join(parts)
+
+
+def current_mods():
+    """Modificateurs pressés à l'instant t : RegisterHotKey les fournit, le crochet souris non."""
+    m = 0
+    if user32.GetAsyncKeyState(0x11) & 0x8000: m |= MOD_CONTROL
+    if user32.GetAsyncKeyState(0x12) & 0x8000: m |= MOD_ALT
+    if user32.GetAsyncKeyState(0x10) & 0x8000: m |= MOD_SHIFT
+    if (user32.GetAsyncKeyState(0x5B) | user32.GetAsyncKeyState(0x5C)) & 0x8000: m |= MOD_WIN
+    return m
 
 
 def combo_name(vk, mods=0):
@@ -288,6 +317,7 @@ class Config:
         "dismissed_update_tag": "",   # version refusée : pas de re-proposition auto tant qu'elle est la dernière
         "turn_focus": False,          # affiche le perso qui clignote dans la barre des tâches (début de tour)
         "turn_focus_cycle_only": True,
+        "mouse_passthrough": False,   # un bouton de souris lié est consommé (pas transmis au jeu)
     }
 
     def __init__(self):
@@ -788,6 +818,114 @@ def arrange_windows(hwnds, mode, monitor_index=0):
 _HK_NEXT, _HK_PREV, _HK_DIRECT, _HK_PRESET = 1, 2, 10, 100
 
 
+# ============================================================
+# CROCHET SOURIS (boutons 4 / 5 / molette)
+# ============================================================
+WH_MOUSE_LL = 14
+WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
+WM_XBUTTONDOWN, WM_XBUTTONUP = 0x020B, 0x020C
+_MOUSE_DOWN = {WM_MBUTTONDOWN, WM_XBUTTONDOWN}
+_MOUSE_UP   = {WM_MBUTTONUP, WM_XBUTTONUP}
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+
+_LL_PROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+user32.SetWindowsHookExW.argtypes   = [ctypes.c_int, _LL_PROC, wintypes.HINSTANCE, wintypes.DWORD]
+user32.SetWindowsHookExW.restype    = wintypes.HHOOK
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+user32.CallNextHookEx.argtypes      = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+user32.CallNextHookEx.restype       = wintypes.LPARAM
+
+
+def _mouse_vk_of(msg, mouse_data):
+    if msg in (WM_XBUTTONDOWN, WM_XBUTTONUP):
+        btn = (int(mouse_data) >> 16) & 0xFFFF   # XBUTTON1 = 1 (bouton 4), XBUTTON2 = 2 (bouton 5)
+        return MOUSE_VK_BASE | btn if btn in (1, 2) else 0
+    if msg in (WM_MBUTTONDOWN, WM_MBUTTONUP):
+        return MOUSE_MID
+    return 0
+
+
+class _MouseHook:
+    """Crochet bas niveau WH_MOUSE_LL : seule façon de capter les boutons 4/5 d'une souris,
+    RegisterHotKey ignorant tout ce qui n'est pas le clavier. À installer depuis un thread
+    qui pompe les messages (thread des raccourcis ou thread Tk) — Windows y appelle le
+    rappel. Le rappel doit rendre la main vite (Windows le désactive au bout de ~300 ms) :
+    on se contente donc d'y poster un message, jamais d'y déplacer une fenêtre."""
+
+    def __init__(self, on_button):
+        self._on_button = on_button          # (vk, is_down) -> True si l'événement est consommé
+        self._hook = None
+        self._proc = _LL_PROC(self._cb)      # référence gardée : sinon ramassée par le GC
+        self._swallowed = set()
+
+    @property
+    def active(self):
+        return bool(self._hook)
+
+    def install(self):
+        if self._hook:
+            return True
+        self._hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, None, 0)
+        if not self._hook:
+            log.warning("Crochet souris non installé : boutons de souris indisponibles.")
+        return bool(self._hook)
+
+    def remove(self):
+        if self._hook:
+            user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+        self._swallowed.clear()
+
+    def _cb(self, code, wparam, lparam):
+        if code == 0:
+            try:
+                msg = int(wparam)
+                if msg in _MOUSE_DOWN or msg in _MOUSE_UP:
+                    info = ctypes.cast(lparam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                    vk = _mouse_vk_of(msg, info.mouseData)
+                    if vk:
+                        down = msg in _MOUSE_DOWN
+                        if down:
+                            if self._on_button(vk, True):
+                                self._swallowed.add(vk)
+                                return 1
+                        elif vk in self._swallowed:
+                            # Jamais un relâchement orphelin : le jeu resterait « bouton enfoncé ».
+                            self._swallowed.discard(vk)
+                            self._on_button(vk, False)
+                            return 1
+            except Exception as e:
+                log.error("Crochet souris : %s", e)
+        return user32.CallNextHookEx(self._hook, code, wparam, lparam)
+
+
+class MouseCapture:
+    """Capte le prochain bouton 4/5/molette, pour l'assignation d'un raccourci.
+    Installé depuis le thread Tk, qui pompe déjà les messages."""
+
+    def __init__(self):
+        self.result = None
+        self._hook = _MouseHook(self._press)
+
+    def start(self):
+        self.result = None
+        return self._hook.install()
+
+    def stop(self):
+        self._hook.remove()
+
+    def _press(self, vk, is_down):
+        if is_down and self.result is None:
+            self.result = (vk, current_mods())
+        return True   # toujours consommé : le clic ne doit pas atteindre la fenêtre derrière
+
+
 class HotkeyManager:
     """Thread dédié bloqué sur GetMessageW (0 % CPU au repos), réveillé par
     PostThreadMessageW pour appliquer une nouvelle config, se mettre en pause ou s'arrêter."""
@@ -798,6 +936,8 @@ class HotkeyManager:
         self._ready = threading.Event()
         self._t = None
         self._actions = {}   # id de raccourci -> action (utilisé uniquement dans le thread)
+        self._mouse_binds = {}   # (vk souris, mods) -> id de raccourci
+        self._mouse = _MouseHook(self._on_mouse)
         self.paused = False
 
     def start(self, spec):
@@ -832,22 +972,45 @@ class HotkeyManager:
         for j, (vk, mods, name) in enumerate(spec.get("presets", [])):
             self._actions[_HK_PRESET + j] = ("preset", name)
             entries.append((_HK_PRESET + j, (vk, mods), f"Preset {name}"))
+        self._mouse_binds = {}
+        mouse_labels = []
         for hk_id, (vk, mods), label in entries:
             if not vk:
                 continue
-            if user32.RegisterHotKey(None, hk_id, MOD_NOREPEAT | int(mods), int(vk)):
+            if is_mouse_vk(vk):
+                self._mouse_binds[(int(vk), int(mods))] = hk_id
+                mouse_labels.append(f"{label} ({combo_name(vk, mods)})")
+            elif user32.RegisterHotKey(None, hk_id, MOD_NOREPEAT | int(mods), int(vk)):
                 ids.append(hk_id)
             else:
                 failed.append(f"{label} ({combo_name(vk, mods)})")
+        if self._mouse_binds and not self._mouse.install():
+            self._mouse_binds = {}
+            failed.extend(mouse_labels)
+        elif not self._mouse_binds:
+            self._mouse.remove()
         if failed:
             log.warning("Raccourcis non enregistrés (déjà pris par une autre appli ?) : %s", failed)
         events.put(("hotkeys", failed))
         return ids
 
-    @staticmethod
-    def _unregister(ids):
+    def _unregister(self, ids):
         for hk_id in ids:
             user32.UnregisterHotKey(None, hk_id)
+        self._mouse_binds = {}
+        self._mouse.remove()
+
+    def _on_mouse(self, vk, is_down):
+        """Appelé dans le crochet : ne fait que router, le travail se fait dans la boucle."""
+        if not any(v == vk for v, _ in self._mouse_binds):
+            return False
+        if is_down:
+            hk_id = self._mouse_binds.get((vk, current_mods()))
+            if hk_id is None:
+                return False   # combinaison non liée (ex. Ctrl+Souris 5) : laissée au jeu
+            if self._tid:
+                user32.PostThreadMessageW(self._tid, WM_APP_MOUSE, hk_id, 0)
+        return not config.mouse_passthrough
 
     def _run(self, spec):
         msg = wintypes.MSG()
@@ -877,7 +1040,7 @@ class HotkeyManager:
                         ids = [] if data else self._register(spec)
                 if stop:
                     break
-            elif msg.message == WM_HOTKEY:
+            elif msg.message in (WM_HOTKEY, WM_APP_MOUSE):
                 try:
                     run_action(self._actions.get(msg.wParam))
                 except Exception as e:

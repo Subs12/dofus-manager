@@ -831,6 +831,19 @@ class HotkeysPage(Page):
                       lambda n=name: self._capture(("preset", n)),
                       (lambda n=name: self.app.set_hotkey(("preset", n), None)) if k else None)
 
+        section_label(self.body, "Souris")
+        c = card(self.body)
+        c.pack(fill="x")
+        ctk.CTkLabel(c, text="Les boutons 4 et 5 (et le clic molette) s'assignent comme une touche : "
+                             "cliquez sur « Modifier » puis appuyez sur le bouton. Aucun logiciel "
+                             "constructeur n'est nécessaire.",
+                     font=F(12), text_color=TEXT_DIM, wraplength=620, justify="left"
+                     ).pack(anchor="w", padx=20, pady=(16, 4))
+        switch_row(c, "Transmettre aussi le clic au jeu",
+                   "Par défaut, un bouton de souris associé à un raccourci est intercepté et "
+                   "n'atteint pas Dofus. Activez si le bouton doit garder son rôle dans le jeu.",
+                   config.mouse_passthrough, lambda v: self.app.set_option("mouse_passthrough", v))
+
         section_label(self.body, "Pause")
         c = card(self.body)
         c.pack(fill="x")
@@ -838,8 +851,8 @@ class HotkeysPage(Page):
                                     "Libère les touches (pour écrire dans le chat, par ex.). "
                                     "Aussi accessible depuis la barre latérale et l'icône de notification.",
                                     self.app.paused, self.app.set_paused)
-        ctk.CTkLabel(self.body, text="Astuce : les touches F13 à F24 sont idéales sur une souris ou un "
-                                     "clavier programmable — elles n'entrent jamais en conflit avec le jeu.",
+        ctk.CTkLabel(self.body, text="Astuce : les boutons 4/5 de la souris et les touches F13 à F24 sont "
+                                     "les plus pratiques — ils n'entrent jamais en conflit avec le jeu.",
                      font=F(11), text_color=TEXT_FAINT, wraplength=700, justify="left"
                      ).pack(anchor="w", pady=(16, 0))
 

@@ -386,7 +386,7 @@ class Toaster:
 # CAPTURE D'UNE COMBINAISON DE TOUCHES
 # ============================================================
 class KeyCaptureDialog(ctk.CTkToplevel):
-    """Appuyez sur une touche (avec Ctrl/Alt/Shift éventuels). Échap annule."""
+    """Appuyez sur une touche ou un bouton de souris (4, 5, molette). Échap annule."""
 
     def __init__(self, parent, title, callback, allow_clear=True):
         super().__init__(parent)
@@ -398,7 +398,7 @@ class KeyCaptureDialog(ctk.CTkToplevel):
         self.transient(parent.winfo_toplevel())
 
         ctk.CTkLabel(self, text=title, font=F(15, "bold"), text_color=TEXT).pack(pady=(26, 4))
-        ctk.CTkLabel(self, text="Appuyez sur la touche ou la combinaison souhaitée",
+        ctk.CTkLabel(self, text="Appuyez sur la touche, la combinaison ou le bouton de souris souhaité",
                      font=F(11), text_color=TEXT_DIM).pack()
         self.preview = ctk.CTkLabel(self, text="…", font=F(20, "bold"), text_color=ACCENT,
                                     fg_color=ACCENT_SOFT, corner_radius=10, width=220, height=48)
@@ -408,6 +408,10 @@ class KeyCaptureDialog(ctk.CTkToplevel):
 
         self.allow_clear = allow_clear
         self.bind("<KeyPress>", self._on_key)
+        # Les boutons 4/5 ne parviennent pas à Tk : ils passent par un crochet souris.
+        self.mouse = core.MouseCapture()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Destroy>", self._on_destroy)
         self.after(80, self._grab)
 
     def _grab(self):
@@ -417,6 +421,27 @@ class KeyCaptureDialog(ctk.CTkToplevel):
             self.grab_set()
         except tk.TclError:
             pass
+        self.mouse.start()
+        self._poll_mouse()
+
+    def _poll_mouse(self):
+        if not self.winfo_exists():
+            return
+        combo = self.mouse.result
+        if combo:
+            self.mouse.stop()
+            self._accept(combo)
+        else:
+            self.after(30, self._poll_mouse)
+
+    def _on_destroy(self, event):
+        if event.widget is self:
+            self.mouse.stop()
+
+    def _accept(self, combo):
+        self.preview.configure(text=core.combo_name(*combo))
+        self.unbind("<KeyPress>")
+        self.after(180, lambda: (self.destroy(), self.callback(combo)))
 
     def _on_key(self, event):
         if event.keysym == "Escape":
@@ -429,6 +454,5 @@ class KeyCaptureDialog(ctk.CTkToplevel):
         combo = core.event_to_combo(event)
         if combo is None:
             return
-        self.preview.configure(text=core.combo_name(*combo))
-        self.after(180, lambda: (self.destroy(), self.callback(combo)))
-        self.unbind("<KeyPress>")
+        self.mouse.stop()
+        self._accept(combo)
