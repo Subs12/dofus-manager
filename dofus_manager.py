@@ -79,6 +79,7 @@ class App(ctk.CTk):
         self.attributes("-topmost", config.always_on_top)
 
         hotkeys.start(config.hotkey_spec())
+        core.turns.start()
         self.refresh()
         self.show_page("windows")
         if _HAS_TRAY:
@@ -839,6 +840,7 @@ class App(ctk.CTk):
         self._quitting = True
         core.stats.flush()
         hotkeys.stop()
+        core.turns.stop()
         if self._tray:
             try:
                 self._tray.stop()

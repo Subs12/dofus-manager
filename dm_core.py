@@ -28,7 +28,7 @@ import win32process
 import winerror
 
 APP_NAME    = "Dofus Manager"
-APP_VERSION = "4.3"
+APP_VERSION = "4.4"
 APP_AUTHOR  = "Subs12"
 COPYRIGHT   = f"© 2026 {APP_AUTHOR}"
 
@@ -286,6 +286,8 @@ class Config:
         "preset_keys": {},            # {nom_preset: {"vkey", "mods"}}
         "char_classes": {},           # {perso: classe} mémorisé pour les persos déconnectés
         "dismissed_update_tag": "",   # version refusée : pas de re-proposition auto tant qu'elle est la dernière
+        "turn_focus": False,          # affiche le perso qui clignote dans la barre des tâches (début de tour)
+        "turn_focus_cycle_only": True,
     }
 
     def __init__(self):
@@ -884,6 +886,108 @@ class HotkeyManager:
 
 
 hotkeys = HotkeyManager()
+
+# ============================================================
+# TOUR DE JEU (clignotement de la barre des tâches)
+# ============================================================
+_HSHELL_FLASH = 0x8006
+user32.RegisterShellHookWindow.argtypes   = [wintypes.HWND]
+user32.DeregisterShellHookWindow.argtypes = [wintypes.HWND]
+
+
+def _is_game_window(hwnd):
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return is_dofus_process(pid)
+    except Exception:
+        return False
+
+
+class TurnWatcher:
+    """Affiche le perso dont la fenêtre clignote dans la barre des tâches (début de tour).
+
+    Repose uniquement sur la notification shell HSHELL_FLASH que Windows envoie à une
+    fenêtre cachée du manager : aucun accès au processus du jeu.
+    """
+    _CLASS = "DofusManagerTurnWatcher"
+
+    def __init__(self):
+        self._hwnd = None
+        self._shell_msg = 0
+        self._last = {}
+
+    def start(self):
+        if self._hwnd is None:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        if self._hwnd:
+            try:
+                win32gui.PostMessage(self._hwnd, win32con.WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+
+    def _run(self):
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.lpszClassName = self._CLASS
+            wc.hInstance = win32api.GetModuleHandle(None)
+            wc.lpfnWndProc = self._wndproc
+            try:
+                win32gui.RegisterClass(wc)
+            except win32gui.error:
+                pass
+            # Fenêtre top-level jamais affichée : une fenêtre message-only ne reçoit pas les notifications shell.
+            self._hwnd = win32gui.CreateWindowEx(0, self._CLASS, self._CLASS, 0, 0, 0, 0, 0,
+                                                 0, 0, wc.hInstance, None)
+            self._shell_msg = win32gui.RegisterWindowMessage("SHELLHOOK")
+            if not user32.RegisterShellHookWindow(self._hwnd):
+                log.warning("Suivi des tours indisponible.")
+                return
+            win32gui.PumpMessages()
+        except Exception as e:
+            log.error("Suivi des tours : %s", e)
+        finally:
+            self._hwnd = None
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if self._shell_msg and msg == self._shell_msg:
+            if wparam == _HSHELL_FLASH and config.turn_focus:
+                try:
+                    self._on_flash(lparam)
+                except Exception as e:
+                    log.error("Suivi des tours : %s", e)
+            return 0
+        if msg == win32con.WM_CLOSE:
+            user32.DeregisterShellHookWindow(hwnd)
+            win32gui.DestroyWindow(hwnd)
+            return 0
+        if msg == win32con.WM_DESTROY:
+            win32gui.PostQuitMessage(0)
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _on_flash(self, hwnd):
+        if hotkeys.paused or not win32gui.IsWindow(hwnd):
+            return
+        fg = user32.GetForegroundWindow()
+        # Déjà affiché, ou l'utilisateur est hors du jeu (chat, navigateur) : on ne vole pas le focus.
+        if hwnd == fg or not _is_game_window(fg):
+            return
+        order = next((o for o, h, _ in cycler.snapshot() if h == hwnd), 0)
+        if not order and (config.turn_focus_cycle_only or not _is_game_window(hwnd)):
+            return
+        now = time.time()
+        if now - self._last.get(hwnd, 0) < 1.5:  # une fenêtre clignote plusieurs fois par tour
+            return
+        self._last[hwnd] = now
+        if focus_window(hwnd, config.auto_maximize):
+            title = win32gui.GetWindowText(hwnd).strip()
+            events.put(("switch", order, hwnd, title))
+            log.info("Début de tour : %s", char_name(title))
+
+
+turns = TurnWatcher()
 
 # ============================================================
 # INSTANCE UNIQUE

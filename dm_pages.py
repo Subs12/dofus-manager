@@ -899,6 +899,16 @@ class SettingsPage(Page):
         sl.bind("<ButtonRelease-1>", lambda e: config.save())
         sl.pack(side="right", fill="x", expand=True, padx=16)
         button(row, "Tester", a.test_overlay, "subtle").pack(side="right")
+        divider(c)
+        switch_row(c, "Passer au personnage dont c'est le tour",
+                   "Quand Dofus fait clignoter un personnage dans la barre des tâches (début de tour), "
+                   "il est affiché automatiquement. Activez la notification de tour dans les options du jeu. "
+                   "N'agit que si vous êtes déjà sur une fenêtre Dofus.",
+                   config.turn_focus, lambda v: a.set_option("turn_focus", v))
+        divider(c)
+        switch_row(c, "Seulement les personnages du cycle",
+                   "Ignore les autres fenêtres Dofus (mules, personnages hors équipe).",
+                   config.turn_focus_cycle_only, lambda v: a.set_option("turn_focus_cycle_only", v))
 
         section_label(body, "Application")
         c = card(body)
