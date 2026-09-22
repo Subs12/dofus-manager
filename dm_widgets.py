@@ -6,8 +6,6 @@ import tkinter as tk
 import unicodedata
 
 import customtkinter as ctk
-import win32con
-import win32gui
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import dm_core as core
@@ -43,7 +41,23 @@ CLASS_COLORS = {
     "huppermage": "#8E44AD", "ouginak": "#A0522D", "forgelance": "#607D8B",
 }
 
-FONT = "Segoe UI"
+FONT = "Helvetica Neue" if core.IS_MAC else "Segoe UI"
+
+# Police grasse pour les images générées par Pillow (icône, pastilles de position).
+_BOLD_FONTS = ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/Library/Fonts/Arial Bold.ttf",
+               "/System/Library/Fonts/Helvetica.ttc") if core.IS_MAC else ("segoeuib.ttf",)
+
+
+def _bold_font(size):
+    for path in _BOLD_FONTS:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def F(size=13, weight="normal"):
@@ -66,15 +80,52 @@ def resolve(color):
 
 
 # ============================================================
-# ICÔNES VECTORIELLES (police Segoe Fluent Icons / MDL2 de Windows)
+# ICÔNES VECTORIELLES (police Segoe Fluent Icons / MDL2 sous Windows, SF Symbols sous macOS)
 # ============================================================
-_ICON_FONT = next((p for p in (r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf")
-                   if os.path.exists(p)), None)
+_ICON_FONT = None if core.IS_MAC else next(
+    (p for p in (r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf") if os.path.exists(p)), None)
 ICONS = {"people": "\uE716", "star": "\uE734", "stats": "\uE9D9", "keyboard": "\uE765",
          "settings": "\uE713", "refresh": "\uE72C", "play": "\uE768", "pause": "\uE769",
          "save": "\uE74E", "add": "\uE710", "check": "\uE73E", "up": "\uE70E", "down": "\uE70D",
          "more": "\uE712", "game": "\uE7FC", "search": "\uE721", "delete": "\uE74D", "edit": "\uE70F"}
+SF_SYMBOLS = {"people": "person.2.fill", "star": "star.fill", "stats": "chart.bar.fill",
+              "keyboard": "keyboard", "settings": "gearshape.fill", "refresh": "arrow.clockwise",
+              "play": "play.fill", "pause": "pause.fill", "save": "square.and.arrow.down", "add": "plus",
+              "check": "checkmark", "up": "chevron.up", "down": "chevron.down", "more": "ellipsis",
+              "game": "gamecontroller.fill", "search": "magnifyingglass", "delete": "trash",
+              "edit": "pencil"}
 _icon_cache = {}
+_sf_cache = {}
+
+
+def _sf_mask(name, size):
+    """Canal alpha d'un SF Symbol rendu à size x size (None si indisponible)."""
+    key = (name, size)
+    if key not in _sf_cache:
+        _sf_cache[key] = None
+        try:
+            import io
+            import AppKit
+            img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(SF_SYMBOLS[name], None)
+            if img is not None:
+                cfg = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                    size * 0.78, AppKit.NSFontWeightMedium)
+                img = img.imageWithSymbolConfiguration_(cfg) or img
+                rep_ = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+                    None, size, size, 8, 4, True, False, AppKit.NSDeviceRGBColorSpace, 0, 0)
+                AppKit.NSGraphicsContext.saveGraphicsState()
+                AppKit.NSGraphicsContext.setCurrentContext_(
+                    AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep_))
+                w, h = img.size().width, img.size().height
+                scale = min(size / w, size / h) if w and h else 1
+                dw, dh = w * scale, h * scale
+                img.drawInRect_(AppKit.NSMakeRect((size - dw) / 2, (size - dh) / 2, dw, dh))
+                AppKit.NSGraphicsContext.restoreGraphicsState()
+                png = rep_.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+                _sf_cache[key] = Image.open(io.BytesIO(bytes(png))).convert("RGBA").getchannel("A")
+        except Exception as e:
+            core.log.debug("SF Symbol %s : %s", name, e)
+    return _sf_cache[key]
 
 
 def _glyph(char, size, color):
@@ -85,15 +136,28 @@ def _glyph(char, size, color):
     return img.resize((size, size), Image.LANCZOS)
 
 
+def _symbol(name, size, color):
+    mask = _sf_mask(name, size * 4)
+    if mask is None:
+        return None
+    img = Image.new("RGBA", mask.size, color)
+    img.putalpha(mask)
+    return img.resize((size * 2, size * 2), Image.LANCZOS)  # 2x : net en Retina
+
+
 def icon(name, size=16, color=TEXT_DIM):
     """CTkImage (variantes clair/sombre) ou None si la police d'icônes est absente."""
-    if not _ICON_FONT or name not in ICONS:
+    if name not in ICONS or not (_ICON_FONT or (core.IS_MAC and name in SF_SYMBOLS)):
         return None
     key = (name, size, str(color))
     if key not in _icon_cache:
         light, dark = (color, color) if isinstance(color, str) else color
-        _icon_cache[key] = ctk.CTkImage(light_image=_glyph(ICONS[name], size, light),
-                                        dark_image=_glyph(ICONS[name], size, dark), size=(size, size))
+        if core.IS_MAC:
+            li, di = _symbol(name, size, light), _symbol(name, size, dark)
+            _icon_cache[key] = ctk.CTkImage(light_image=li, dark_image=di, size=(size, size)) if li else None
+        else:
+            _icon_cache[key] = ctk.CTkImage(light_image=_glyph(ICONS[name], size, light),
+                                            dark_image=_glyph(ICONS[name], size, dark), size=(size, size))
     return _icon_cache[key]
 
 
@@ -157,10 +221,7 @@ def _render_avatar(cid, size, order):
         cs = int(big * 0.42)
         cx0 = big - cs
         d.ellipse((cx0, cx0, big - 1, big - 1), fill=order_color(order), outline="white", width=max(3, big // 36))
-        try:
-            fnt = ImageFont.truetype("segoeuib.ttf", int(cs * 0.6))
-        except OSError:
-            fnt = ImageFont.load_default()
+        fnt = _bold_font(int(cs * 0.6))
         d.text((cx0 + cs / 2, cx0 + cs / 2), str(order), font=fnt, fill="white", anchor="mm")
     return out.resize((size, size), Image.LANCZOS)
 
@@ -194,10 +255,7 @@ def make_app_icon(size=256):
     mask = Image.new("L", (big, big), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, big - 1, big - 1], radius=int(big * 0.24), fill=255)
     img.putalpha(mask)
-    try:
-        fnt = ImageFont.truetype("segoeuib.ttf", int(big * 0.62))
-    except OSError:
-        fnt = ImageFont.load_default()
+    fnt = _bold_font(int(big * 0.62))
     d = ImageDraw.Draw(img)
     bbox = d.textbbox((0, 0), "D", font=fnt)
     w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -208,17 +266,7 @@ def make_app_icon(size=256):
 # ============================================================
 # OUTILS FENÊTRES FLOTTANTES
 # ============================================================
-def make_click_through(tk_win):
-    """Fenêtre flottante qui ne vole jamais le focus ni les clics (le jeu garde la main)."""
-    try:
-        tk_win.update_idletasks()
-        hwnd = win32gui.GetParent(tk_win.winfo_id()) or tk_win.winfo_id()
-        ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        ex |= (win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT |
-               win32con.WS_EX_TOOLWINDOW | 0x08000000)  # WS_EX_NOACTIVATE
-        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex)
-    except Exception as e:
-        core.log.debug("click-through: %s", e)
+make_click_through = core.make_click_through  # fenêtre flottante sans focus ni clics
 
 
 # ============================================================
@@ -255,6 +303,15 @@ class SwitchOverlay:
         self.dots = tk.Canvas(txt, height=10, highlightthickness=0, bd=0)
         self.dots.pack(anchor="w", pady=(6, 0))
         make_click_through(w)
+
+    def prepare(self):
+        """Crée l'overlay d'avance, pendant que le manager est au premier plan (macOS : le
+        premier affichage d'une fenêtre Tk passe par AppKit)."""
+        if self.win is None or not self.win.winfo_exists():
+            self._build()
+            self.win.attributes("-alpha", 0.0)
+            core.show_floating(self.win)
+            core.hide_floating(self.win)
 
     def show(self, order, hwnd, title, total=0):
         if self.win is None or not self.win.winfo_exists():
@@ -306,8 +363,7 @@ class SwitchOverlay:
         else:
             x, y = (self.win.winfo_screenwidth() - w) // 2, 24
         self.win.geometry(f"+{x}+{y}")
-        self.win.deiconify()
-        self.win.lift()
+        core.show_floating(self.win)
         self._hide_job = self.root.after(max(300, int(core.config.overlay_ms)), self._fade)
 
     def _fade(self, alpha=0.96):
@@ -316,7 +372,7 @@ class SwitchOverlay:
             return
         alpha -= 0.16
         if alpha <= 0:
-            self.win.withdraw()
+            core.hide_floating(self.win)
             self._fade_job = None
             return
         self.win.attributes("-alpha", alpha)

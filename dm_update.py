@@ -21,6 +21,8 @@ _API = f"https://api.github.com/repos/{REPO}/releases/latest"
 _HEADERS = {"User-Agent": f"DofusManager/{core.APP_VERSION}", "Accept": "application/vnd.github+json"}
 _CREATE_NO_WINDOW = 0x08000000
 _MIN_EXE_SIZE = 5_000_000  # un exe valide fait ~30 Mo ; en dessous, le téléchargement est incomplet
+# Asset attendu dans la release : l'exe sous Windows, le .app zippé (ditto) sous macOS.
+_ASSET_SUFFIX = "-macos.zip" if core.IS_MAC else ".exe"
 
 
 def _open(url, timeout):
@@ -40,7 +42,7 @@ def check_update():
         return None  # rien à vérifier hors exe compilé (mode développement)
     with _open(_API, 15) as r:
         data = json.load(r)
-    asset = next((a for a in data.get("assets", []) if a.get("name", "").lower().endswith(".exe")), None)
+    asset = next((a for a in data.get("assets", []) if a.get("name", "").lower().endswith(_ASSET_SUFFIX)), None)
     tag = data.get("tag_name", "")
     if asset and _version_tuple(tag) > _version_tuple(core.APP_VERSION):
         return tag, (data.get("body") or "").strip(), {"url": asset["browser_download_url"],
@@ -50,7 +52,7 @@ def check_update():
 
 def download(tag, asset):
     """Télécharge l'exe de la release dans un dossier temporaire. Retourne son chemin."""
-    path = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_update_")) / "DofusManager.exe"
+    path = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_update_")) / ("DofusManager" + _ASSET_SUFFIX)
     try:
         with _open(asset["url"], 30) as r, open(path, "wb") as f:
             shutil.copyfileobj(r, f, 1 << 20)
@@ -62,7 +64,38 @@ def download(tag, asset):
     return path
 
 
+def _install_and_restart_mac(zip_path):
+    """Remplace le .app courant par celui de l'archive puis le relance.
+
+    Un script shell détaché attend la fin du processus, bascule les bundles (l'ancien est
+    gardé en « .bak » jusqu'à la fin de la copie) puis rouvre l'appli.
+    """
+    exe = pathlib.Path(sys.executable).resolve()
+    bundle = next((p for p in exe.parents if p.suffix == ".app"), None)
+    if bundle is None:
+        raise RuntimeError("application introuvable (lancée hors d'un .app)")
+    staging = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_new_"))
+    subprocess.run(["/usr/bin/ditto", "-x", "-k", str(zip_path), str(staging)], check=True)
+    new_app = next(staging.glob("*.app"), None)
+    if new_app is None:
+        raise RuntimeError("archive de mise à jour invalide")
+    subprocess.run(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(new_app)], check=False)
+    script = (
+        'while kill -0 "$DM_PID" 2>/dev/null; do sleep 0.5; done\n'
+        'rm -rf "$DM_CUR.bak"\n'
+        'mv "$DM_CUR" "$DM_CUR.bak" && mv "$DM_NEW" "$DM_CUR" && rm -rf "$DM_CUR.bak" '
+        '|| { rm -rf "$DM_CUR"; mv "$DM_CUR.bak" "$DM_CUR"; }\n'
+        'open "$DM_CUR"\n'
+    )
+    env = dict(os.environ, DM_PID=str(os.getpid()), DM_CUR=str(bundle), DM_NEW=str(new_app))
+    subprocess.Popen(["/bin/sh", "-c", script], env=env, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    core.log.info("Mise à jour : redémarrage vers %s", new_app)
+
+
 def install_and_restart(new_exe_path):
+    if core.IS_MAC:
+        return _install_and_restart_mac(new_exe_path)
     """Remplace l'exe courant par le nouveau et relance l'application.
 
     L'exe en cours d'exécution est verrouillé par Windows : impossible de

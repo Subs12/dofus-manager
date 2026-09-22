@@ -1,0 +1,8 @@
+customtkinter==5.2.2
+pillow
+pystray
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+pyinstaller

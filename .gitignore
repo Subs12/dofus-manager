@@ -4,3 +4,5 @@ build/
 dist/
 *.spec
 assets/icon.ico
+.venv/
+.DS_Store

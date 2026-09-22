@@ -10,7 +10,7 @@ py -3.13 -c "from dm_widgets import make_app_icon; make_app_icon(256).save('asse
 py -3.13 -m PyInstaller --noconfirm --onefile --windowed --name DofusManager `
     --icon assets/icon.ico --version-file assets/version_info.txt `
     --add-data "assets/classes;assets/classes" `
-    --collect-data customtkinter --hidden-import pystray._win32 --hidden-import PIL._tkinter_finder `
+    --collect-data customtkinter --hidden-import pystray._win32 --hidden-import PIL._tkinter_finder --exclude-module dm_mac `
     dofus_manager.py
 if ($LASTEXITCODE -ne 0) { throw "Échec de PyInstaller" }
 

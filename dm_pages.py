@@ -263,7 +263,7 @@ class WindowsPage(Page):
 
         tb = ctk.CTkFrame(self, fg_color="transparent")
         tb.pack(fill="x", padx=32, pady=(0, 12))
-        self.search = ctk.CTkEntry(tb, placeholder_text="Rechercher un personnage…  (Ctrl+F)",
+        self.search = ctk.CTkEntry(tb, placeholder_text=f"Rechercher un personnage…  ({core.SHORTCUT_MOD_NAME}{'' if core.IS_MAC else '+'}F)",
                                    height=36, corner_radius=10, fg_color=CARD, border_color=BORDER,
                                    text_color=TEXT, font=F(12))
         self.search.pack(side="left", fill="x", expand=True, padx=(0, 10))
@@ -849,9 +849,10 @@ class HotkeysPage(Page):
         c.pack(fill="x")
         self.pause_var = switch_row(c, "Mettre les raccourcis en pause",
                                     "Libère les touches (pour écrire dans le chat, par ex.). "
-                                    "Aussi accessible depuis la barre latérale et l'icône de notification.",
+                                    f"Aussi accessible depuis la barre latérale et l'icône de la {core.TRAY_LABEL}.",
                                     self.app.paused, self.app.set_paused)
-        ctk.CTkLabel(self.body, text="Astuce : les boutons 4/5 de la souris et les touches F13 à F24 sont "
+        ctk.CTkLabel(self.body, text="Astuce : les boutons 4/5 de la souris et les touches "
+                                     f"{'F13 à F20' if core.IS_MAC else 'F13 à F24'} sont "
                                      "les plus pratiques — ils n'entrent jamais en conflit avec le jeu.",
                      font=F(11), text_color=TEXT_FAINT, wraplength=700, justify="left"
                      ).pack(anchor="w", pady=(16, 0))
@@ -912,6 +913,13 @@ class SettingsPage(Page):
         sl.bind("<ButtonRelease-1>", lambda e: config.save())
         sl.pack(side="right", fill="x", expand=True, padx=16)
         button(row, "Tester", a.test_overlay, "subtle").pack(side="right")
+        if core.HAS_TURN_WATCH:
+            self._turn_rows(c)
+
+        self._app_section(body)
+
+    def _turn_rows(self, c):
+        a = self.app
         divider(c)
         switch_row(c, "Passer au personnage dont c'est le tour",
                    "Quand Dofus fait clignoter un personnage dans la barre des tâches (début de tour), "
@@ -923,15 +931,17 @@ class SettingsPage(Page):
                    "Ignore les autres fenêtres Dofus (mules, personnages hors équipe).",
                    config.turn_focus_cycle_only, lambda v: a.set_option("turn_focus_cycle_only", v))
 
+    def _app_section(self, body):
+        a = self.app
         section_label(body, "Application")
         c = card(body)
         c.pack(fill="x")
         rows = [
             ("Notifications", "Confirmations discrètes en bas de la fenêtre.", "show_notifs"),
             ("Toujours au premier plan", "Garde le manager au-dessus des autres fenêtres.", "always_on_top"),
-            ("Réduire dans la zone de notification", "Fermer la fenêtre garde le manager actif en arrière-plan.",
+            (f"Réduire dans la {core.TRAY_LABEL}", "Fermer la fenêtre garde le manager actif en arrière-plan.",
              "minimize_to_tray"),
-            ("Démarrer réduit", "Au lancement, ne pas afficher la fenêtre (icône de notification seulement).",
+            ("Démarrer réduit", f"Au lancement, ne pas afficher la fenêtre (icône dans la {core.TRAY_LABEL} seulement).",
              "start_minimized"),
             ("Reprendre le cyclage automatiquement", "Au démarrage, réapplique l'ordre mémorisé ou le preset "
                                                      "par défaut dès que les personnages sont détectés.",
@@ -942,7 +952,7 @@ class SettingsPage(Page):
                 divider(c)
             switch_row(c, t, d, getattr(config, key), lambda v, k=key: a.set_option(k, v))
         divider(c)
-        switch_row(c, "Démarrer avec Windows", "Lance le manager à l'ouverture de session.",
+        switch_row(c, core.STARTUP_LABEL, "Lance le manager à l'ouverture de session.",
                    core.is_startup_enabled(), a.set_startup)
 
         section_label(body, "Données")
@@ -952,7 +962,7 @@ class SettingsPage(Page):
         row.pack(fill="x", padx=20, pady=16)
         button(row, "Exporter l'ordre", a.export_layout).pack(side="left")
         button(row, "Importer", a.import_layout).pack(side="left", padx=8)
-        button(row, "Ouvrir le dossier", lambda: os.startfile(core.APP_DIR), "subtle").pack(side="right")
+        button(row, "Ouvrir le dossier", lambda: core.open_folder(core.APP_DIR), "subtle").pack(side="right")
 
         section_label(body, "À propos")
         c = card(body)
@@ -965,7 +975,7 @@ class SettingsPage(Page):
                      text_color=ACCENT).pack(side="left")
         button(row, "Vérifier les mises à jour", a.check_update_now, "subtle").pack(side="right")
         ctk.CTkLabel(c, text="Gestionnaire de fenêtres multi-comptes pour Dofus 3. Utilise uniquement les "
-                             "fonctions de fenêtrage de Windows : aucune lecture ni écriture dans la mémoire "
+                             f"fonctions de fenêtrage de {'macOS' if core.IS_MAC else 'Windows'} : aucune lecture ni écriture dans la mémoire "
                              "du jeu, aucune injection, aucune automatisation d'actions en jeu.",
                      font=F(11), text_color=TEXT_DIM, wraplength=680, justify="left"
                      ).pack(anchor="w", padx=20, pady=(0, 10))
