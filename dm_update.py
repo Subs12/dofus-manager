@@ -21,8 +21,9 @@ _API = f"https://api.github.com/repos/{REPO}/releases/latest"
 _HEADERS = {"User-Agent": f"DofusManager/{core.APP_VERSION}", "Accept": "application/vnd.github+json"}
 _CREATE_NO_WINDOW = 0x08000000
 _MIN_EXE_SIZE = 5_000_000  # un exe valide fait ~30 Mo ; en dessous, le téléchargement est incomplet
-# Asset attendu dans la release : l'exe sous Windows, le .app zippé (ditto) sous macOS.
-_ASSET_SUFFIX = "-macos.zip" if core.IS_MAC else ".exe"
+# Asset attendu dans la release : DofusManager-<version>-windows.exe / -macos.dmg.
+# Sous Windows, tout .exe convient (les releases ≤ 4.6 publiaient « DofusManager.exe »).
+_ASSET_SUFFIX = "-macos.dmg" if core.IS_MAC else ".exe"
 
 
 def _open(url, timeout):
@@ -64,8 +65,8 @@ def download(tag, asset):
     return path
 
 
-def _install_and_restart_mac(zip_path):
-    """Remplace le .app courant par celui de l'archive puis le relance.
+def _install_and_restart_mac(dmg_path):
+    """Remplace le .app courant par celui du .dmg de la release puis le relance.
 
     Un script shell détaché attend la fin du processus, bascule les bundles (l'ancien est
     gardé en « .bak » jusqu'à la fin de la copie) puis rouvre l'appli.
@@ -75,10 +76,17 @@ def _install_and_restart_mac(zip_path):
     if bundle is None:
         raise RuntimeError("application introuvable (lancée hors d'un .app)")
     staging = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_new_"))
-    subprocess.run(["/usr/bin/ditto", "-x", "-k", str(zip_path), str(staging)], check=True)
-    new_app = next(staging.glob("*.app"), None)
-    if new_app is None:
-        raise RuntimeError("archive de mise à jour invalide")
+    mount = pathlib.Path(tempfile.mkdtemp(prefix="dofusmanager_dmg_"))
+    subprocess.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen",
+                    "-mountpoint", str(mount), str(dmg_path)], check=True, capture_output=True)
+    try:
+        src = next(mount.glob("*.app"), None)
+        if src is None:
+            raise RuntimeError("image disque de mise à jour invalide")
+        new_app = staging / src.name
+        subprocess.run(["/usr/bin/ditto", str(src), str(new_app)], check=True)
+    finally:
+        subprocess.run(["/usr/bin/hdiutil", "detach", "-quiet", str(mount)], check=False)
     subprocess.run(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(new_app)], check=False)
     script = (
         'while kill -0 "$DM_PID" 2>/dev/null; do sleep 0.5; done\n'

@@ -1,19 +1,21 @@
 #!/bin/bash
-# Dofus Manager — compilation macOS : dist/Dofus Manager.app, puis DofusManager-<version>.dmg
-# (glisser-déposer dans Applications) et DofusManager-<version>-macos.zip (asset de mise à jour).
-#   ./build_mac.sh
+# Dofus Manager — compilation macOS : dist/DofusManager-<version>-macos.dmg
+# (glisser-déposer dans Applications ; c'est aussi le fichier de mise à jour automatique).
+#   ./build_mac.sh                 (PYTHON=python3.14 ./build_mac.sh pour un autre interpréteur)
+# La version vient de APP_VERSION (dm_core.py), via tools/version.py : jamais saisie ici.
 # Prérequis : Python 3 de python.org (Tk inclus). Le venv .venv est créé au besoin.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="Dofus Manager"
-VERSION=$(sed -n 's/^APP_VERSION *= *"\(.*\)"/\1/p' dm_core.py)
+VERSION=$(python3 tools/version.py)
+DMG="dist/DofusManager-$VERSION-macos.dmg"
 # Compilation hors du Bureau : iCloud/Finder y ajoutent des attributs étendus que codesign refuse.
 WORK=$(mktemp -d /tmp/dofusmanager_build.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 if [ ! -x .venv/bin/python ]; then
-    python3 -m venv .venv
+    "${PYTHON:-python3}" -m venv .venv
 fi
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements-mac.txt
@@ -52,20 +54,28 @@ xattr -cr "$BUNDLE"
 codesign --force --deep --sign - "$BUNDLE"
 codesign --verify --deep --strict "$BUNDLE"
 
-mkdir -p dist
-rm -rf "dist/$APP.app" "dist/$APP" "dist/DofusManager-$VERSION-macos.zip" "dist/DofusManager-$VERSION.dmg"
+# Contrôle : la version inscrite dans le .app doit être celle de dm_core.py.
+ACTUAL=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
+if [ "$ACTUAL" != "$VERSION" ]; then
+    echo "Version du .app ($ACTUAL) différente de APP_VERSION ($VERSION)" >&2
+    exit 1
+fi
 
-# Archive de mise à jour (asset GitHub attendu par dm_update)
-ditto -c -k --keepParent "$BUNDLE" "dist/DofusManager-$VERSION-macos.zip"
+mkdir -p dist
+rm -f "$DMG"
 
 # DMG : l'app + un raccourci vers Applications
 mkdir -p "$WORK/dmg"
 ditto "$BUNDLE" "$WORK/dmg/$APP.app"
 ln -s /Applications "$WORK/dmg/Applications"
-hdiutil create -volname "$APP" -srcfolder "$WORK/dmg" -ov -format UDZO "dist/DofusManager-$VERSION.dmg" >/dev/null
+# hdiutil échoue parfois (« Resource busy ») sur les machines de CI : quelques essais.
+for attempt in 1 2 3 4 5; do
+    hdiutil create -volname "$APP $VERSION" -srcfolder "$WORK/dmg" -ov -format UDZO "$DMG" >/dev/null && break
+    [ "$attempt" = 5 ] && exit 1
+    sleep 5
+done
 
 # Pas de .app dans dist/ : si le dossier est synchronisé par iCloud (Bureau, Documents), les
 # attributs étendus ajoutés cassent la signature et macOS refuse l'autorisation Accessibilité.
 # L'app s'installe depuis le DMG, dans /Applications.
-echo "OK : dist/DofusManager-$VERSION.dmg"
-echo "     dist/DofusManager-$VERSION-macos.zip"
+echo "OK : $DMG (version $ACTUAL)"

@@ -1,0 +1,118 @@
+# Compile Dofus Manager pour Windows et macOS à partir du même commit, puis publie
+# les deux fichiers dans une seule release GitHub.
+#
+# - Tag « vX.Y » poussé (voir tools/release.py) : compilation + release.
+# - Pull request / lancement manuel : compilation seule (fichiers téléchargeables
+#   dans l'onglet Actions), pour vérifier que les deux versions se construisent.
+#
+# La version vient uniquement de APP_VERSION (dm_core.py). Le tag doit lui être
+# identique, et la version inscrite dans l'exe et dans le .app est contrôlée.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Lire APP_VERSION et la comparer au tag
+        run: |
+          echo "version=$(python3 tools/version.py)" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python3 tools/version.py --check "$GITHUB_REF_NAME"
+          fi
+
+  windows:
+    name: Windows (.exe)
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compiler
+        shell: pwsh
+        run: .\build.ps1 -Python python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/DofusManager-${{ needs.version.outputs.version }}-windows.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS (.dmg)
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Compiler
+        run: PYTHON=python ./build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/DofusManager-${{ needs.version.outputs.version }}-macos.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publier la release
+    if: github.ref_type == 'tag'
+    needs: [version, windows, macos]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Notes de version (message du tag + installation)
+        run: |
+          git fetch --force --tags
+          git tag -l --format='%(contents)' "$TAG" | sed '/-----BEGIN PGP SIGNATURE-----/,$d' > notes.md
+          cat >> notes.md <<EOF
+
+          ---
+          ### Téléchargement
+          | Système | Fichier |
+          |---|---|
+          | Windows 10 / 11 | \`DofusManager-$VERSION-windows.exe\` |
+          | macOS 11+ (Apple Silicon) | \`DofusManager-$VERSION-macos.dmg\` |
+
+          Les deux fichiers sont compilés depuis le même commit : même version, mêmes fonctionnalités.
+          Installation et première ouverture sur Mac : voir le [README](https://github.com/${{ github.repository }}#installation).
+          EOF
+          cat notes.md
+      - name: Créer ou mettre à jour la release
+        run: |
+          ls -l dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Dofus Manager $TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "Dofus Manager $TAG" --notes-file notes.md --verify-tag
+          fi
+          gh release upload "$TAG" dist/* --clobber
