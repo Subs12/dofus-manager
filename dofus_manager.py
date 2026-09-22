@@ -52,9 +52,14 @@ class App(ctk.CTk):
         self._splash = None if config.start_minimized else self._show_splash()
         self._splash_t = time.time()
         try:
-            self.icon_img.save(ICO_PATH, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (256, 256)])
-            self.iconbitmap(str(ICO_PATH))
-            _patch_toplevel_icon()
+            if core.IS_MAC:
+                # Icône du Dock quand l'appli tourne depuis les sources (le .app a son .icns).
+                self._dock_icon = ImageTk.PhotoImage(self.icon_img)
+                self.iconphoto(True, self._dock_icon)
+            else:
+                self.icon_img.save(ICO_PATH, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (256, 256)])
+                self.iconbitmap(str(ICO_PATH))
+                _patch_toplevel_icon()
         except Exception as e:
             log.debug("icon: %s", e)
 
@@ -72,6 +77,7 @@ class App(ctk.CTk):
         self._update_busy = False
         self._pending_update = None
         self._quitting = False
+        self._ax_ok = True            # macOS : autorisation Accessibilité accordée
 
         self.overlay = SwitchOverlay(self)
         self.toaster = Toaster(self)
@@ -86,10 +92,15 @@ class App(ctk.CTk):
             self._start_tray()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.bind_all("<Control-f>", lambda e: (self.show_page("windows"), self.pages["windows"].search.focus_set()))
+        mod = core.SHORTCUT_MOD
+        self.bind_all(f"<{mod}-f>", lambda e: (self.show_page("windows"), self.pages["windows"].search.focus_set()))
         self.bind_all("<F5>", lambda e: self.refresh())
         for i, (key, *_rest) in enumerate(NAV, start=1):
-            self.bind_all(f"<Control-Key-{i}>", lambda e, k=key: self.show_page(k))
+            self.bind_all(f"<{mod}-Key-{i}>", lambda e, k=key: self.show_page(k))
+        if core.IS_MAC:
+            self.createcommand("::tk::mac::Quit", self.quit_app)          # ⌘Q, menu Dofus Manager
+            self.bind_all("<Command-r>", lambda e: self.refresh())
+            self.after(2000, self.overlay.prepare)
 
         self.after(40, self._pump_events)
         self.after(400, self._tick_foreground)
@@ -99,7 +110,7 @@ class App(ctk.CTk):
             remaining = max(0, int(1600 - (time.time() - self._splash_t) * 1000))
             self.after(remaining, self._end_splash)
         self.after(3000, self._periodic_update_check)  # après le splash, mainloop lancée
-        _listen_show_requests()
+        core.listen_show_requests(lambda: core.events.put(("tray", "open")), self)
         log.info("App started (v%s)", core.APP_VERSION)
 
     # ============================================================
@@ -361,13 +372,15 @@ class App(ctk.CTk):
             self._on_update_found(*ev[1:])
         elif kind == "update_ready":
             self._install_update(ev[1])
+        elif kind == "permission":
+            self._on_permission(ev[1])
         elif kind == "update_error":
             self._update_busy = False
             self.toast(f"Mise à jour impossible : {ev[1]}", "error")
 
     def _tick_foreground(self):
         try:
-            self._set_foreground(core.user32.GetForegroundWindow())
+            self._set_foreground(core.get_foreground_window())
         finally:
             self.after(400, self._tick_foreground)
 
@@ -697,13 +710,30 @@ class App(ctk.CTk):
         self.pages["hotkeys"].render()
         self._update_status()
 
+    _AX_HELP = ("Autorisez Dofus Manager dans Réglages Système › Confidentialité et sécurité › "
+                "Accessibilité : sans cela, ni les fenêtres Dofus ni les raccourcis ne sont accessibles.")
+
     def _on_hotkey_status(self, failed):
         self.failed_hotkeys = failed
         self.pages["hotkeys"].set_failed(failed)
+        if not self._ax_ok:
+            self.pages["windows"].set_banner(self._AX_HELP)
+            return
         self.pages["windows"].set_banner(
             ("Raccourcis indisponibles : " + ", ".join(failed) + " — changez-les dans Raccourcis.") if failed else "")
         if failed:
             self.toast("Certains raccourcis sont déjà pris par une autre application.", "error")
+
+    def _on_permission(self, ok):
+        """macOS : l'autorisation Accessibilité conditionne la détection et les raccourcis."""
+        self._ax_ok = ok
+        if ok:
+            self.pages["windows"].set_banner("")
+            self.toast("Autorisation Accessibilité accordée : raccourcis actifs.", "success")
+            self.refresh()
+        else:
+            self.pages["windows"].set_banner(self._AX_HELP)
+            core.accessibility_trusted(prompt=True)   # boîte système « Ouvrir Réglages Système »
 
     def set_paused(self, paused):
         self.paused = bool(paused)
@@ -732,7 +762,7 @@ class App(ctk.CTk):
 
     def set_startup(self, enabled):
         core.set_startup_enabled(enabled)
-        self.toast("Lancement au démarrage de Windows " + ("activé." if enabled else "désactivé."))
+        self.toast(f"{core.STARTUP_LABEL} : " + ("activé." if enabled else "désactivé."))
 
     def test_overlay(self):
         w = self._get(self.foreground) or (self._ordered() or self.windows or [None])[0]
@@ -794,7 +824,13 @@ class App(ctk.CTk):
         try:
             self._tray = pystray.Icon("DofusManager", make_app_icon(64),
                                       f"{core.APP_NAME} · {core.APP_AUTHOR}", menu)
-            threading.Thread(target=self._tray.run, daemon=True).start()
+            if core.IS_MAC:
+                # AppKit : l'icône de la barre des menus vit sur le thread principal, dont la
+                # boucle d'événements est déjà celle de Tk.
+                self._tray.run_detached()
+                self._tray.visible = True
+            else:
+                threading.Thread(target=self._tray.run, daemon=True).start()
         except Exception as e:
             log.warning("Tray indisponible : %s", e)
             self._tray = None
@@ -830,7 +866,7 @@ class App(ctk.CTk):
             if not self._tray_hint_shown:
                 self._tray_hint_shown = True
                 try:
-                    self._tray.notify("Dofus Manager reste actif dans la zone de notification.", core.APP_NAME)
+                    self._tray.notify(f"Dofus Manager reste actif dans la {core.TRAY_LABEL}.", core.APP_NAME)
                 except Exception:
                     pass
         else:
@@ -845,7 +881,10 @@ class App(ctk.CTk):
         core.turns.stop()
         if self._tray:
             try:
-                self._tray.stop()
+                if core.IS_MAC:
+                    self._tray.visible = False  # stop() arrêterait la boucle AppKit de Tk
+                else:
+                    self._tray.stop()
             except Exception:
                 pass
         log.info("App stopped")
@@ -863,46 +902,17 @@ def _patch_toplevel_icon():
     ctk.CTkToplevel.__init__ = init
 
 
-_SHOW_EVENT = "Local\\DofusManager_ShowWindow"
-
-
-def _listen_show_requests():
-    """Un 2e lancement (raccourci, menu Démarrer) réaffiche l'instance déjà ouverte."""
-    try:
-        import win32event
-        h = win32event.CreateEvent(None, False, False, _SHOW_EVENT)
-    except Exception as e:
-        log.debug("Événement d'affichage : %s", e)
-        return
-
-    def wait():
-        while True:
-            if win32event.WaitForSingleObject(h, win32event.INFINITE) == win32event.WAIT_OBJECT_0:
-                core.events.put(("tray", "open"))
-    threading.Thread(target=wait, daemon=True).start()
-
-
-def _signal_running_instance():
-    try:
-        import win32event
-        h = win32event.OpenEvent(0x0002, False, _SHOW_EVENT)  # EVENT_MODIFY_STATE
-        win32event.SetEvent(h)
-        return True
-    except Exception:
-        return False  # instance plus ancienne sans cet événement
-
-
 def main():
     if not core.acquire_single_instance():
         log.warning("Instance déjà lancée — arrêt.")
-        if _signal_running_instance():
+        if core.signal_running_instance():
             sys.exit(0)
         ctk.set_appearance_mode(config.theme)
         root = ctk.CTk()
         root.withdraw()
         from tkinter import messagebox
         messagebox.showinfo(core.APP_NAME, "Dofus Manager est déjà lancé.\n"
-                                           "Retrouvez-le dans la zone de notification.")
+                                           f"Retrouvez-le dans la {core.TRAY_LABEL}.")
         root.destroy()
         sys.exit(0)
     App().mainloop()
